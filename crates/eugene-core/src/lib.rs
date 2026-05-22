@@ -84,6 +84,18 @@ impl Message {
     }
 }
 
+/// Provider-neutral description of a callable tool. Conversion to the
+/// provider-specific shape (Anthropic `Tool`, OpenAI `ChatCompletionTool`,
+/// Gemini `FunctionDeclaration`) lives in the provider adapter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema describing the tool's input. Typically produced by
+    /// `schemars::schema_for!` on the input struct.
+    pub input_schema: serde_json::Value,
+}
+
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error("agent did not converge within {0} turns")]
