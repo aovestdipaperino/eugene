@@ -1,0 +1,13 @@
+[package]
+name = "eugene-prompt"
+version = "0.1.0"
+description = "Four-layer prompt builder for the eugene agent crates"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dev-dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

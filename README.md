@@ -8,7 +8,7 @@ The crates land here as the series progresses. They are intentionally small. The
 
 | Crate | Status |
 |-------|--------|
-| `eugene-core` | _planned (Part 3)_ |
+| `eugene-core` | shipped (Part 1) |
 | `eugene-prompt` | _planned (Part 2)_ |
 | `eugene-skills` | _planned (Part 3)_ |
 | `eugene-state` | _planned (Part 4)_ |
