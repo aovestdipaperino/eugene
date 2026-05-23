@@ -50,6 +50,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use thiserror::Error;
 
+pub mod hooks;
+pub use hooks::{HookOutcome, PermissionGate, SkillHook};
+
 /// Errors a skill can return. The agent can distinguish transient failures
 /// (worth retrying) from terminal ones (give up and report to the model).
 #[derive(Debug, Error)]
@@ -115,6 +118,29 @@ pub trait Skill: Send + Sync + 'static {
         self.is_read_only()
     }
 
+    /// Alternative names the model can use to call this skill. Useful
+    /// for backwards compatibility when a skill is renamed: keep the
+    /// old name as an alias for a release or two before retiring it.
+    fn aliases(&self) -> &[&'static str] {
+        &[]
+    }
+
+    /// One-line capability phrase (3-10 words, no trailing period) used
+    /// by `Registry::search` to surface this skill on keyword match.
+    /// Prefer terms that are NOT already in the skill name. The same
+    /// convention Claude Code's `searchHint` follows for `ToolSearch`.
+    fn search_hint(&self) -> Option<&str> {
+        None
+    }
+
+    /// True when the schema for this skill should be omitted from the
+    /// initial tool list and only surfaced after a `Registry::search`
+    /// hit. Use for agents with many skills whose prompt would otherwise
+    /// balloon: hide the long tail, keep the core always-loaded.
+    fn should_defer(&self) -> bool {
+        false
+    }
+
     /// Run the tool. The output is whatever string the model should see.
     /// Structured results travel as JSON inside this string.
     async fn run(&self, input: Self::Input) -> Result<String, SkillError>;
@@ -125,6 +151,9 @@ pub trait Skill: Send + Sync + 'static {
 pub trait DynSkill: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn metadata(&self) -> SkillMetadata;
+    fn aliases(&self) -> Vec<&'static str>;
+    fn search_hint(&self) -> Option<&str>;
+    fn should_defer(&self) -> bool;
     async fn run_json(&self, args: &Value) -> Result<String, SkillError>;
 }
 
@@ -155,6 +184,18 @@ impl<S: Skill> DynSkill for S {
         }
     }
 
+    fn aliases(&self) -> Vec<&'static str> {
+        Skill::aliases(self).to_vec()
+    }
+
+    fn search_hint(&self) -> Option<&str> {
+        Skill::search_hint(self)
+    }
+
+    fn should_defer(&self) -> bool {
+        Skill::should_defer(self)
+    }
+
     async fn run_json(&self, args: &Value) -> Result<String, SkillError> {
         let input: S::Input = serde_json::from_value(args.clone())?;
         self.run(input).await
@@ -165,7 +206,9 @@ impl<S: Skill> DynSkill for S {
 #[derive(Default)]
 pub struct Registry {
     skills: Vec<Box<dyn DynSkill>>,
+    /// Maps both primary names and aliases to the skill index.
     index: HashMap<String, usize>,
+    hooks: Vec<Box<dyn SkillHook>>,
 }
 
 impl Registry {
@@ -177,18 +220,62 @@ impl Registry {
     pub fn add<S: Skill>(&mut self, skill: S) -> &mut Self {
         let boxed: Box<dyn DynSkill> = Box::new(skill);
         let name = boxed.definition().name;
+        let aliases = boxed.aliases();
         if let Some(&idx) = self.index.get(&name) {
             self.skills[idx] = boxed;
         } else {
-            self.index.insert(name, self.skills.len());
+            let new_idx = self.skills.len();
+            self.index.insert(name, new_idx);
+            for alias in &aliases {
+                self.index.insert(alias.to_string(), new_idx);
+            }
             self.skills.push(boxed);
         }
+        self
+    }
+
+    /// Register a hook. Hooks run in registration order around every
+    /// dispatch. The first hook that denies short-circuits the chain.
+    pub fn with_hook(&mut self, hook: impl SkillHook) -> &mut Self {
+        self.hooks.push(Box::new(hook));
         self
     }
 
     /// Tool definitions, ready for the system prompt or the provider call.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.skills.iter().map(|s| s.definition()).collect()
+    }
+
+    /// Non-deferred tool definitions only. Use this when you support
+    /// keyword discovery via `search`: the always-loaded set goes in
+    /// the initial prompt, the deferred long tail surfaces on demand.
+    pub fn loaded_definitions(&self) -> Vec<ToolDefinition> {
+        self.skills
+            .iter()
+            .filter(|s| !s.should_defer())
+            .map(|s| s.definition())
+            .collect()
+    }
+
+    /// Look up skills by keyword. Matches the skill name, its aliases,
+    /// and its `search_hint`. The result is the same `ToolDefinition`
+    /// shape so the caller can hand it straight to the provider.
+    pub fn search(&self, query: &str) -> Vec<ToolDefinition> {
+        let q = query.to_ascii_lowercase();
+        self.skills
+            .iter()
+            .filter(|s| {
+                let def = s.definition();
+                def.name.to_ascii_lowercase().contains(&q)
+                    || s.aliases()
+                        .iter()
+                        .any(|a| a.to_ascii_lowercase().contains(&q))
+                    || s.search_hint()
+                        .map(|h| h.to_ascii_lowercase().contains(&q))
+                        .unwrap_or(false)
+            })
+            .map(|s| s.definition())
+            .collect()
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -202,13 +289,44 @@ impl Registry {
     /// Run one tool call. Returns the model-facing string on success,
     /// or a `SkillError` on failure (the agent typically renders the
     /// error back to the model as a `tool_result` with `is_error: true`).
+    /// Pre/post hooks fire around the dispatch.
     pub async fn run(&self, name: &str, args: &Value) -> Result<String, SkillError> {
         let idx = self
             .index
             .get(name)
             .copied()
             .ok_or_else(|| SkillError::Tool(format!("unknown tool: {name}")))?;
-        self.skills[idx].run_json(args).await
+        let skill = self.skills[idx].as_ref();
+        let metadata = skill.metadata();
+
+        let mut effective_args = args.clone();
+        for hook in &self.hooks {
+            match hook.before(name, metadata, &effective_args).await? {
+                HookOutcome::Proceed => {}
+                HookOutcome::Modify(v) => effective_args = v,
+                HookOutcome::Deny(reason) => {
+                    let denied: Result<String, SkillError> = Err(SkillError::Safety(reason));
+                    return self.run_after_hooks(name, &effective_args, denied).await;
+                }
+                HookOutcome::Replace(out) => {
+                    return self.run_after_hooks(name, &effective_args, Ok(out)).await;
+                }
+            }
+        }
+        let result = skill.run_json(&effective_args).await;
+        self.run_after_hooks(name, &effective_args, result).await
+    }
+
+    async fn run_after_hooks(
+        &self,
+        name: &str,
+        args: &Value,
+        mut result: Result<String, SkillError>,
+    ) -> Result<String, SkillError> {
+        for hook in &self.hooks {
+            result = hook.after(name, args, result).await;
+        }
+        result
     }
 
     /// Run several tool calls. Read-only / concurrency-safe calls run in
@@ -271,6 +389,15 @@ impl DynSkill for MissingSkill {
             is_destructive: false,
             is_concurrency_safe: false,
         }
+    }
+    fn aliases(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+    fn search_hint(&self) -> Option<&str> {
+        None
+    }
+    fn should_defer(&self) -> bool {
+        false
     }
     async fn run_json(&self, _args: &Value) -> Result<String, SkillError> {
         Err(SkillError::Tool("unknown tool".into()))
@@ -508,5 +635,166 @@ mod tests {
         assert!(by_id["a"].is_ok());
         assert!(matches!(by_id["b"], Err(SkillError::Tool(_))));
         let _ = Mutex::new(()); // keep std::sync used
+    }
+
+    // --------- Hook + discovery tests ---------
+
+    #[derive(Deserialize, JsonSchema)]
+    struct RmArgs {
+        path: String,
+    }
+    struct Rm;
+    #[async_trait]
+    impl Skill for Rm {
+        type Input = RmArgs;
+        fn name(&self) -> &str {
+            "delete_file"
+        }
+        fn aliases(&self) -> &[&'static str] {
+            &["rm"]
+        }
+        fn description(&self) -> &str {
+            "Delete a file (irreversible)."
+        }
+        fn is_read_only(&self) -> bool {
+            false
+        }
+        fn is_destructive(&self) -> bool {
+            true
+        }
+        fn search_hint(&self) -> Option<&str> {
+            Some("remove unlink trash")
+        }
+        async fn run(&self, _: RmArgs) -> Result<String, SkillError> {
+            Ok("deleted".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn aliases_resolve_to_the_same_skill() {
+        let mut reg = Registry::new();
+        reg.add(Rm);
+        let primary = reg
+            .run("delete_file", &serde_json::json!({ "path": "x" }))
+            .await
+            .unwrap();
+        let alias = reg
+            .run("rm", &serde_json::json!({ "path": "x" }))
+            .await
+            .unwrap();
+        assert_eq!(primary, alias);
+    }
+
+    #[tokio::test]
+    async fn search_matches_hint_and_alias() {
+        let mut reg = Registry::new();
+        reg.add(Rm);
+        assert_eq!(reg.search("unlink").len(), 1);
+        assert_eq!(reg.search("rm").len(), 1);
+        assert_eq!(reg.search("nothing-matches").len(), 0);
+    }
+
+    struct Deferred;
+    #[derive(Deserialize, JsonSchema)]
+    struct DeferredArgs {}
+    #[async_trait]
+    impl Skill for Deferred {
+        type Input = DeferredArgs;
+        fn name(&self) -> &str {
+            "rare_capability"
+        }
+        fn description(&self) -> &str {
+            "Something rarely needed."
+        }
+        fn should_defer(&self) -> bool {
+            true
+        }
+        async fn run(&self, _: DeferredArgs) -> Result<String, SkillError> {
+            Ok("ran".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn loaded_definitions_omit_deferred_skills() {
+        let mut reg = Registry::new();
+        reg.add(Echo).add(Deferred);
+        let loaded: Vec<_> = reg
+            .loaded_definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        let all: Vec<_> = reg.definitions().into_iter().map(|d| d.name).collect();
+        assert!(loaded.contains(&"echo".to_string()));
+        assert!(!loaded.contains(&"rare_capability".to_string()));
+        assert!(all.contains(&"rare_capability".to_string()));
+    }
+
+    #[tokio::test]
+    async fn pre_hook_can_deny_destructive_call() {
+        let mut reg = Registry::new();
+        reg.add(Rm)
+            .with_hook(PermissionGate::new(|_, md: SkillMetadata| {
+                !md.is_destructive
+            }));
+        let err = reg
+            .run("delete_file", &serde_json::json!({ "path": "x" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SkillError::Safety(_)));
+    }
+
+    #[tokio::test]
+    async fn pre_hook_can_replace_output() {
+        struct CacheHook;
+        #[async_trait]
+        impl SkillHook for CacheHook {
+            async fn before(
+                &self,
+                name: &str,
+                _md: SkillMetadata,
+                _args: &Value,
+            ) -> Result<HookOutcome, SkillError> {
+                if name == "echo" {
+                    Ok(HookOutcome::Replace("cached".into()))
+                } else {
+                    Ok(HookOutcome::Proceed)
+                }
+            }
+        }
+        let mut reg = Registry::new();
+        reg.add(Echo).with_hook(CacheHook);
+        let out = reg
+            .run("echo", &serde_json::json!({ "message": "live" }))
+            .await
+            .unwrap();
+        assert_eq!(out, "cached");
+    }
+
+    #[tokio::test]
+    async fn pre_hook_can_rewrite_args() {
+        struct InjectPrefix;
+        #[async_trait]
+        impl SkillHook for InjectPrefix {
+            async fn before(
+                &self,
+                _name: &str,
+                _md: SkillMetadata,
+                args: &Value,
+            ) -> Result<HookOutcome, SkillError> {
+                let mut new_args = args.clone();
+                if let Some(s) = args.get("message").and_then(Value::as_str) {
+                    let injected = format!("[redacted] {s}");
+                    new_args["message"] = Value::String(injected);
+                }
+                Ok(HookOutcome::Modify(new_args))
+            }
+        }
+        let mut reg = Registry::new();
+        reg.add(Echo).with_hook(InjectPrefix);
+        let out = reg
+            .run("echo", &serde_json::json!({ "message": "secret" }))
+            .await
+            .unwrap();
+        assert_eq!(out, "[redacted] secret");
     }
 }
