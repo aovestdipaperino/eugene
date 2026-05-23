@@ -51,6 +51,9 @@ pub mod sqlite;
 mod memory;
 pub use memory::InMemoryCheckpointer;
 
+pub mod hooks;
+pub use hooks::{HookOutcome, ModeGate, NodeHook, PermissionMode};
+
 #[derive(Debug, Error)]
 pub enum GraphError {
     #[error("unknown node: {0}")]
@@ -98,6 +101,12 @@ where
     /// Stable, unique node name. Lowercase, kebab- or snake-case.
     fn name(&self) -> &'static str;
 
+    /// Minimum permission mode the node needs. Defaults to `Default`.
+    /// `ModeGate` consults this when deciding whether to interrupt.
+    fn requires_mode(&self) -> PermissionMode {
+        PermissionMode::Default
+    }
+
     async fn run(&self, state: &mut S) -> Result<NextStep, GraphError>;
 }
 
@@ -137,6 +146,7 @@ where
     S: Send + Sync + 'static,
 {
     nodes: HashMap<&'static str, Box<dyn Node<S>>>,
+    hooks: Vec<Box<dyn NodeHook<S>>>,
     entry: &'static str,
     max_steps: usize,
     retry_attempts: u32,
@@ -149,6 +159,7 @@ where
     pub fn new(entry: &'static str) -> Self {
         Self {
             nodes: HashMap::new(),
+            hooks: Vec::new(),
             entry,
             max_steps: 32,
             retry_attempts: 1,
@@ -174,6 +185,15 @@ where
         self
     }
 
+    /// Register a hook that runs before and after every node. Hooks
+    /// execute in registration order; the first one that returns
+    /// `HookOutcome::Interrupt` short-circuits the others and pauses
+    /// the graph.
+    pub fn with_hook(&mut self, hook: impl NodeHook<S>) -> &mut Self {
+        self.hooks.push(Box::new(hook));
+        self
+    }
+
     /// Run the graph from the entry node with an initial state.
     pub async fn run(&self, initial: S) -> Result<Outcome<S>, GraphError> {
         self.run_from(initial, self.entry).await
@@ -186,7 +206,22 @@ where
 
         for _ in 0..self.max_steps {
             let node = &self.nodes[current];
-            let next = self.run_node_with_retry(node.as_ref(), &mut state).await?;
+            match self.run_pre_hooks(current, node.as_ref(), &state).await? {
+                PreOutcome::Interrupt(reason) => {
+                    return Ok(Outcome::Interrupted {
+                        state,
+                        next_node: current.to_string(),
+                        reason,
+                    });
+                }
+                PreOutcome::Skip(next_name) => {
+                    current = self.lookup(next_name)?;
+                    continue;
+                }
+                PreOutcome::Proceed => {}
+            }
+            let raw = self.run_node_with_retry(node.as_ref(), &mut state).await?;
+            let next = self.run_post_hooks(current, &state, raw).await?;
             match next {
                 NextStep::Halt => return Ok(Outcome::Done(state)),
                 NextStep::Interrupt { reason } => {
@@ -224,7 +259,24 @@ where
 
         for _ in 0..self.max_steps {
             let node = &self.nodes[current];
-            let next = self.run_node_with_retry(node.as_ref(), &mut state).await?;
+            match self.run_pre_hooks(current, node.as_ref(), &state).await? {
+                PreOutcome::Interrupt(reason) => {
+                    ckpt.save(run_id, current, &state).await?;
+                    return Ok(Outcome::Interrupted {
+                        state,
+                        next_node: current.to_string(),
+                        reason,
+                    });
+                }
+                PreOutcome::Skip(next_name) => {
+                    current = self.lookup(next_name)?;
+                    ckpt.save(run_id, current, &state).await?;
+                    continue;
+                }
+                PreOutcome::Proceed => {}
+            }
+            let raw = self.run_node_with_retry(node.as_ref(), &mut state).await?;
+            let next = self.run_post_hooks(current, &state, raw).await?;
             match next {
                 NextStep::Halt => {
                     ckpt.delete(run_id).await?;
@@ -245,6 +297,35 @@ where
             }
         }
         Err(GraphError::MaxSteps(self.max_steps))
+    }
+
+    async fn run_pre_hooks(
+        &self,
+        node_name: &'static str,
+        node: &dyn Node<S>,
+        state: &S,
+    ) -> Result<PreOutcome, GraphError> {
+        let required = node.requires_mode();
+        for hook in &self.hooks {
+            match hook.before(node_name, required, state).await? {
+                HookOutcome::Proceed => {}
+                HookOutcome::Skip(next) => return Ok(PreOutcome::Skip(next)),
+                HookOutcome::Interrupt(reason) => return Ok(PreOutcome::Interrupt(reason)),
+            }
+        }
+        Ok(PreOutcome::Proceed)
+    }
+
+    async fn run_post_hooks(
+        &self,
+        node_name: &'static str,
+        state: &S,
+        mut result: NextStep,
+    ) -> Result<NextStep, GraphError> {
+        for hook in &self.hooks {
+            result = hook.after(node_name, state, result).await?;
+        }
+        Ok(result)
     }
 
     async fn run_node_with_retry(
@@ -272,6 +353,12 @@ where
             .copied()
             .ok_or_else(|| GraphError::UnknownNode(name.to_string()))
     }
+}
+
+enum PreOutcome {
+    Proceed,
+    Skip(&'static str),
+    Interrupt(String),
 }
 
 #[cfg(test)]
@@ -478,5 +565,159 @@ mod tests {
             other => panic!("expected done, got {other:?}"),
         }
         assert!(ckpt.load("run-1").await.unwrap().is_none());
+    }
+
+    #[derive(Default, Clone, Debug, Serialize, Deserialize)]
+    struct ModeState {
+        mode: PermissionMode,
+        applied: bool,
+    }
+
+    struct DestructiveEdit;
+    #[async_trait]
+    impl Node<ModeState> for DestructiveEdit {
+        fn name(&self) -> &'static str {
+            "edit"
+        }
+        fn requires_mode(&self) -> PermissionMode {
+            PermissionMode::AcceptEdits
+        }
+        async fn run(&self, s: &mut ModeState) -> Result<NextStep, GraphError> {
+            s.applied = true;
+            Ok(NextStep::Halt)
+        }
+    }
+
+    #[tokio::test]
+    async fn mode_gate_interrupts_when_mode_too_low() {
+        let mut g = Graph::<ModeState>::new("edit");
+        g.add(DestructiveEdit)
+            .with_hook(ModeGate::new(|s: &ModeState| s.mode));
+        let outcome = g
+            .run(ModeState {
+                mode: PermissionMode::Plan,
+                applied: false,
+            })
+            .await
+            .unwrap();
+        match outcome {
+            Outcome::Interrupted { state, reason, .. } => {
+                assert!(!state.applied);
+                assert!(reason.contains("AcceptEdits"));
+                assert!(reason.contains("Plan"));
+            }
+            other => panic!("expected interrupt, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mode_gate_passes_when_mode_satisfies() {
+        let mut g = Graph::<ModeState>::new("edit");
+        g.add(DestructiveEdit)
+            .with_hook(ModeGate::new(|s: &ModeState| s.mode));
+        let outcome = g
+            .run(ModeState {
+                mode: PermissionMode::AcceptEdits,
+                applied: false,
+            })
+            .await
+            .unwrap();
+        match outcome {
+            Outcome::Done(s) => assert!(s.applied),
+            other => panic!("expected done, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_hook_can_rewrite_next_step() {
+        // A hook that promotes any Halt into a Goto. Useful for stitching
+        // shared "cleanup" nodes onto graphs that otherwise terminate.
+        struct ForceFinalize;
+        #[async_trait]
+        impl NodeHook<State> for ForceFinalize {
+            async fn after(
+                &self,
+                _node: &str,
+                _state: &State,
+                result: NextStep,
+            ) -> Result<NextStep, GraphError> {
+                Ok(match result {
+                    NextStep::Halt => NextStep::Goto("finalize"),
+                    other => other,
+                })
+            }
+        }
+        struct Start;
+        #[async_trait]
+        impl Node<State> for Start {
+            fn name(&self) -> &'static str {
+                "start"
+            }
+            async fn run(&self, s: &mut State) -> Result<NextStep, GraphError> {
+                s.log.push("start".into());
+                Ok(NextStep::Halt)
+            }
+        }
+        struct Finalize;
+        #[async_trait]
+        impl Node<State> for Finalize {
+            fn name(&self) -> &'static str {
+                "finalize"
+            }
+            async fn run(&self, s: &mut State) -> Result<NextStep, GraphError> {
+                s.log.push("finalize".into());
+                Ok(NextStep::Halt)
+            }
+        }
+
+        let mut g = Graph::<State>::new("start");
+        g.add(Start).add(Finalize).with_hook(ForceFinalize);
+
+        // The hook hijacks the first Halt, but only the first: it always
+        // rewrites Halt, so the test asserts the immediate next step is
+        // taken. The second Halt would loop, so the test caps via a known
+        // outcome and a max_steps protection.
+        let g2 = {
+            let mut g2 = Graph::<State>::new("start").max_steps(3);
+            g2.add(Start)
+                .add(Finalize)
+                .with_hook(NoopAfterFirst::default());
+            g2
+        };
+
+        // Run the graph with the always-rewrite hook and confirm max_steps
+        // protection trips. The point is that the post-hook ran.
+        let err = g.run(State::default()).await.unwrap_err();
+        assert!(matches!(err, GraphError::MaxSteps(_)));
+
+        let outcome = g2.run(State::default()).await.unwrap();
+        match outcome {
+            Outcome::Done(s) => {
+                assert_eq!(s.log, vec!["start", "finalize"]);
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
+    }
+
+    // Hook that rewrites the first Halt it sees, then becomes a no-op.
+    #[derive(Default)]
+    struct NoopAfterFirst {
+        fired: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl NodeHook<State> for NoopAfterFirst {
+        async fn after(
+            &self,
+            _node: &str,
+            _state: &State,
+            result: NextStep,
+        ) -> Result<NextStep, GraphError> {
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                if let NextStep::Halt = result {
+                    return Ok(NextStep::Goto("finalize"));
+                }
+            }
+            Ok(result)
+        }
     }
 }
