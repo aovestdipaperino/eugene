@@ -1,0 +1,29 @@
+[package]
+name = "eugene-mcp"
+version = "0.1.0"
+description = "MCP server and client adapters built on rmcp"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eugene-core = { path = "../eugene-core", version = "0.1" }
+eugene-skills = { path = "../eugene-skills", version = "0.1" }
+rmcp = { version = "1", features = [
+    "server",
+    "client",
+    "transport-async-rw",
+    "transport-child-process",
+    "transport-io",
+] }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time"] }
