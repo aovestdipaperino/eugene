@@ -81,11 +81,12 @@ impl Sandbox for E2bSandbox {
             .send()
             .await
             .map_err(|e| SandboxError::Backend(e.to_string()))?;
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             return Err(SandboxError::Backend(format!(
                 "E2B {}: {text}",
-                resp.status().as_u16()
+                status.as_u16()
             )));
         }
         let parsed: ExecResponse = resp
