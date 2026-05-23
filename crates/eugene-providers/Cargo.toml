@@ -1,0 +1,21 @@
+[package]
+name = "eugene-providers"
+version = "0.1.0"
+description = "Provider trait and adapters: one agent, many LLM backends"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eugene-core = { path = "../eugene-core", version = "0.1" }
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
