@@ -1,5 +1,7 @@
 # eugene
 
+[![GitHub stars](https://img.shields.io/github/stars/aovestdipaperino/eugene?logo=github&color=brightgreen)](https://github.com/aovestdipaperino/eugene/stargazers)
+
 A small set of Rust crates for building AI agents. Each crate distills one pattern from the [Building AI Agents in Rust](https://github.com/aovestdipaperino/eugene/tree/main) series into something reusable.
 
 The crates land here as the series progresses. They are intentionally small. The point is to have working primitives, not a framework.
